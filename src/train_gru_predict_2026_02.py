@@ -1,3 +1,19 @@
+"""
+Trains a GRU-based sequence model to predict each customer's top spending category for 2026-02.
+
+High-level flow:
+- Loads the feature store (partitioned Parquet directory, single Parquet, or CSV).
+- Aggregates transaction-level features to monthly customer-level features.
+- Infers category spend columns and builds a supervised dataset where labels are
+  the next month’s top category for each customer.
+- Builds fixed-length monthly sequences per customer for training, testing, and 2026-02 prediction.
+- Scales features using train-only statistics and wraps them in PyTorch datasets/dataloaders.
+- Defines and trains a GRU classifier with a linear head and cross-entropy loss.
+- Evaluates accuracy on a hold-out test month (2026-01) and then predicts
+  the top category for 2026-02 for each customer.
+- Saves predictions to 'data/gru_predictions_2026_02.csv' with one row per customer.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -15,6 +31,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
+# Ensure reproducible randomness across NumPy and PyTorch (CPU and GPU).
 def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -22,6 +39,7 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+# Convert arbitrary period-like strings to month start timestamps (e.g. '2025-08' → 2025-08-01).
 def _to_month_start(s: pd.Series) -> pd.Series:
     dt = pd.to_datetime(s, errors="coerce")
     if dt.isna().any():
@@ -49,6 +67,7 @@ def _read_feature_store(path: Path) -> pd.DataFrame:
     raise ValueError(f"Unsupported feature store path: {path} (expected dir, .parquet, or .csv)")
 
 
+# Infer which numeric columns represent spend by category, excluding known behavioral / payment features.
 def _infer_category_columns(df: pd.DataFrame) -> List[str]:
     reserved = {
         "customer_id",
@@ -88,6 +107,7 @@ def _infer_category_columns(df: pd.DataFrame) -> List[str]:
     return sorted(cats)
 
 
+# Aggregate raw period-level rows to customer–month level, summing counts/spend and averaging ratios.
 def _aggregate_to_monthly(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["month"] = _to_month_start(df["period"])
@@ -115,6 +135,7 @@ def _aggregate_to_monthly(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# Build feature (X) and label (y) frames where the label is the next month’s top spend category per customer.
 def _make_supervised_frames(
     monthly: pd.DataFrame, category_cols: List[str]
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -224,6 +245,7 @@ def _build_sequences_for_months(
     X_monthly = X_monthly.sort_values(["customer_id", "month"]).reset_index(drop=True)
     grouped = {cid: g for cid, g in X_monthly.groupby("customer_id", sort=False)}
 
+    # Build a fixed-length monthly feature sequence ending at a given month for one customer.
     def make_seq(cid: str, end_month: pd.Timestamp) -> np.ndarray | None:
         g = grouped.get(cid)
         if g is None:
@@ -242,6 +264,7 @@ def _build_sequences_for_months(
     train_rows = labeled[labeled["label_month"] <= split.train_end_inclusive].copy()
     test_rows = labeled[labeled["label_month"] == split.test_label_month].copy()
 
+    # Turn labeled rows into aligned (sequence, label) numpy arrays, skipping incomplete histories.
     def build_xy(rows: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         xs = []
         ys = []
@@ -276,11 +299,13 @@ def _build_sequences_for_months(
     return (X_train, y_train), (X_test, y_test), (X_pred, pred_cids)
 
 
+# Compute simple classification accuracy from logits and integer class labels.
 def _accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
     preds = torch.argmax(logits, dim=1)
     return (preds == y).float().mean().item()
 
 
+# End-to-end pipeline: load features, build sequences, train GRU, evaluate, and save 2026-02 predictions.
 def train_and_predict(
     feature_store_path: Path,
     out_predictions_csv: Path,

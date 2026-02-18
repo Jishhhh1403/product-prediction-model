@@ -1,9 +1,20 @@
+"""
+Builds a monthly, customer-level feature store from raw transaction data.
+
+- Reads 'data/raw_transactions.csv' and converts timestamps to monthly periods.
+- Aggregates core behavioral metrics (spend, counts, averages, variability, online ratio, unique merchants).
+- Creates category-level spend pivots and a category diversity feature.
+- Builds payment-method count features using a pivot on 'payment_method'.
+- Adds month-to-month trend features (spend and transaction growth, online ratio change).
+- Fills missing values and writes a partitioned Parquet feature store under 'data/feature_store/period=...'.
+"""
+
 import pandas as pd
 
 df = pd.read_csv("data/raw_transactions.csv")
 df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-# Monthly window
+# Monthly window: aggregate all features at customer–month granularity.
 df["period"] = df["timestamp"].dt.to_period("M")
 
 # ===============================
