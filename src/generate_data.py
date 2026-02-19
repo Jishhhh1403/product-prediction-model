@@ -13,8 +13,7 @@ import numpy as np
 np.random.seed(42)
 
 customers = [f"C00{i}" for i in range(1,6)]
-categories = ["groceries","electronics","travel",
-              "fashion","fuel","entertainment"]
+categories = ["product1","product2","product3","product4","product5","product6"]
 payment_methods = ["card","upi","netbanking"]
 devices = ["mobile","web"]
 cities = ["Mumbai","Delhi","Bangalore","Hyderabad"]

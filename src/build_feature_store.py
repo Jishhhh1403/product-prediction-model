@@ -24,8 +24,9 @@ agg = df.groupby(["customer_id", "period"]).agg(
     total_spent=("amount", "sum"),
     txn_count=("amount", "count"),
     avg_spent=("amount", "mean"),
+    min_spent=("amount", "min"),
     max_spent=("amount", "max"),
-    spend_std_dev=("amount", "std"),   # NEW
+    spend_std_dev=("amount", "std"),   
     online_ratio=("is_online", "mean"),
     unique_merchants=("merchant_id", "nunique"),
 ).reset_index()
@@ -64,26 +65,37 @@ pay_features = pd.pivot_table(
     aggfunc="count",
     fill_value=0,
 ).reset_index()
+payment_cols = pay_features.columns.difference(["customer_id", "period"])
 
 # ===============================
-# MERGE ALL FEATURES
+def _write_partitioned(df: pd.DataFrame, path: str) -> None:
+    out = df.copy()
+    out["period"] = out["period"].astype(str)
+    out.to_parquet(
+        path,
+        engine="pyarrow",
+        partition_cols=["period"],
+        index=False,
+    )
+
+
+# ===============================
+# MERGE ALL FEATURES (COMBINED VIEW)
 # ===============================
 feature_store = (
     agg.merge(cat_features, on=["customer_id", "period"])
-       .merge(pay_features, on=["customer_id", "period"])
+    .merge(pay_features, on=["customer_id", "period"])
 )
 
 # ===============================
-# TREND FEATURES (MONTH-TO-MONTH)
+# TREND & GROWTH FEATURES (MONTH-TO-MONTH)
 # ===============================
-
 feature_store = feature_store.sort_values(["customer_id", "period"])
 
 feature_store["prev_total_spent"] = feature_store.groupby("customer_id")["total_spent"].shift(1)
 feature_store["prev_txn_count"] = feature_store.groupby("customer_id")["txn_count"].shift(1)
 feature_store["prev_online_ratio"] = feature_store.groupby("customer_id")["online_ratio"].shift(1)
 
-# Growth features
 feature_store["spend_growth"] = feature_store["total_spent"] - feature_store["prev_total_spent"]
 feature_store["txn_growth"] = feature_store["txn_count"] - feature_store["prev_txn_count"]
 feature_store["online_ratio_change"] = feature_store["online_ratio"] - feature_store["prev_online_ratio"]
@@ -92,16 +104,49 @@ feature_store["online_ratio_change"] = feature_store["online_ratio"] - feature_s
 feature_store.fillna(0, inplace=True)
 
 # ===============================
-# SAVE FEATURE STORE
+# SPLIT INTO GRU-ORIENTED FEATURE TABLES
 # ===============================
+core_behavior_cols = [
+    "total_spent",
+    "txn_count",
+    "avg_spent",
+    "min_spent",
+    "max_spent",
+    "spend_std_dev",
+    "online_ratio",
+    "unique_merchants",
+    "avg_spend_per_txn",
+    "max_txn_ratio",
+]
 
-feature_store["period"] = feature_store["period"].astype(str)
+core_behavior_features = feature_store[["customer_id", "period"] + core_behavior_cols].copy()
+category_features = feature_store[["customer_id", "period"] + list(category_cols) + ["category_diversity"]].copy()
+payment_features = feature_store[["customer_id", "period"] + list(payment_cols)].copy()
+growth_features = feature_store[["customer_id", "period", "spend_growth", "txn_growth"]].copy()
+trend_features = feature_store[
+    [
+        "customer_id",
+        "period",
+        "prev_total_spent",
+        "prev_txn_count",
+        "prev_online_ratio",
+        "online_ratio_change",
+    ]
+].copy()
 
-feature_store.to_parquet(
-    "data/feature_store/",
-    engine="pyarrow",
-    partition_cols=["period"],
-    index=False,
+# ===============================
+# WRITE OUT PARTITIONED FEATURE TABLES
+# ===============================
+_write_partitioned(core_behavior_features, "data/feature_store_core_behavior")
+_write_partitioned(category_features, "data/feature_store_category")
+_write_partitioned(payment_features, "data/feature_store_payment")
+_write_partitioned(growth_features, "data/feature_store_growth")
+_write_partitioned(trend_features, "data/feature_store_trend")
+
+# Keep original combined feature store for existing GRU pipeline
+_write_partitioned(feature_store, "data/feature_store")
+
+print(
+    "Feature store created with separate tables: "
+    "core_behavior, category, payment, growth, trend (plus combined view)"
 )
-
-print("Feature store created with behavioral + trend features")
