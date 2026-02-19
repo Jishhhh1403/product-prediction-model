@@ -67,6 +67,51 @@ def _read_feature_store(path: Path) -> pd.DataFrame:
     raise ValueError(f"Unsupported feature store path: {path} (expected dir, .parquet, or .csv)")
 
 
+def _read_partitioned_feature_store(path: Path) -> pd.DataFrame:
+    """
+    Reads a hive-partitioned parquet dataset directory such as:
+      data/feature_store_core_behavior
+      data/feature_store_category
+      data/feature_store_payment
+      data/feature_store_growth
+      data/feature_store_trend
+    """
+    if not path.is_dir():
+        raise ValueError(f"Expected partitioned feature store directory, got: {path}")
+    dataset = ds.dataset(str(path), format="parquet", partitioning="hive")
+    return dataset.to_table().to_pandas()
+
+
+def _read_and_merge_feature_stores(
+    core_behavior_path: Path,
+    category_path: Path,
+    payment_path: Path,
+    growth_path: Path,
+    trend_path: Path,
+) -> pd.DataFrame:
+    """
+    Reads all separate feature tables and merges them on (customer_id, period),
+    reproducing the combined view that was previously written to data/feature_store.
+    """
+    core = _read_partitioned_feature_store(core_behavior_path)
+    cat = _read_partitioned_feature_store(category_path)
+    pay = _read_partitioned_feature_store(payment_path)
+    growth = _read_partitioned_feature_store(growth_path)
+    trend = _read_partitioned_feature_store(trend_path)
+
+    for df in (core, cat, pay, growth, trend):
+        if "customer_id" not in df.columns or "period" not in df.columns:
+            raise ValueError("All feature tables must contain 'customer_id' and 'period' columns.")
+
+    merged = (
+        core.merge(cat, on=["customer_id", "period"])
+        .merge(pay, on=["customer_id", "period"])
+        .merge(growth, on=["customer_id", "period"])
+        .merge(trend, on=["customer_id", "period"])
+    )
+    return merged
+
+
 # Infer which numeric columns represent spend by category, excluding known behavioral / payment features.
 def _infer_category_columns(df: pd.DataFrame) -> List[str]:
     reserved = {
@@ -107,8 +152,13 @@ def _infer_category_columns(df: pd.DataFrame) -> List[str]:
     return sorted(cats)
 
 
-# Aggregate raw period-level rows to customer–month level, summing counts/spend and averaging ratios.
 def _aggregate_to_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate raw period-level rows to customer–month level, summing counts/spend
+    and averaging ratios. The separate feature tables are already at monthly
+    granularity, so this is effectively an idempotent aggregation step that
+    also normalizes the 'period' column into a proper month index.
+    """
     df = df.copy()
     df["month"] = _to_month_start(df["period"])
 
@@ -307,7 +357,11 @@ def _accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
 
 # End-to-end pipeline: load features, build sequences, train GRU, evaluate, and save 2026-02 predictions.
 def train_and_predict(
-    feature_store_path: Path,
+    core_behavior_path: Path,
+    category_path: Path,
+    payment_path: Path,
+    growth_path: Path,
+    trend_path: Path,
     out_predictions_csv: Path,
     seq_len: int,
     hidden_dim: int,
@@ -321,9 +375,15 @@ def train_and_predict(
 ) -> None:
     _set_seed(seed)
 
-    raw = _read_feature_store(feature_store_path)
+    raw = _read_and_merge_feature_stores(
+        core_behavior_path=core_behavior_path,
+        category_path=category_path,
+        payment_path=payment_path,
+        growth_path=growth_path,
+        trend_path=trend_path,
+    )
     if "customer_id" not in raw.columns or "period" not in raw.columns:
-        raise ValueError("Feature store must contain at least customer_id and period columns.")
+        raise ValueError("Merged feature store must contain at least customer_id and period columns.")
 
     monthly = _aggregate_to_monthly(raw)
     category_cols = _infer_category_columns(monthly)
@@ -454,10 +514,34 @@ def train_and_predict(
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument(
-        "--feature-store-path",
+        "--core-behavior-path",
         type=Path,
-        default=Path("data/feature_store"),
-        help="Directory of partitioned parquet feature store (recommended), or a .parquet/.csv file.",
+        default=Path("data/feature_store_core_behavior"),
+        help="Directory of partitioned parquet core behavior feature store.",
+    )
+    p.add_argument(
+        "--category-path",
+        type=Path,
+        default=Path("data/feature_store_category"),
+        help="Directory of partitioned parquet category feature store.",
+    )
+    p.add_argument(
+        "--payment-path",
+        type=Path,
+        default=Path("data/feature_store_payment"),
+        help="Directory of partitioned parquet payment feature store.",
+    )
+    p.add_argument(
+        "--growth-path",
+        type=Path,
+        default=Path("data/feature_store_growth"),
+        help="Directory of partitioned parquet growth feature store.",
+    )
+    p.add_argument(
+        "--trend-path",
+        type=Path,
+        default=Path("data/feature_store_trend"),
+        help="Directory of partitioned parquet trend feature store.",
     )
     p.add_argument("--out-predictions-csv", type=Path, default=Path("data/gru_predictions_2026_02.csv"))
     p.add_argument("--seq-len", type=int, default=3)
@@ -472,7 +556,11 @@ def main() -> None:
     args = p.parse_args()
 
     train_and_predict(
-        feature_store_path=args.feature_store_path,
+        core_behavior_path=args.core_behavior_path,
+        category_path=args.category_path,
+        payment_path=args.payment_path,
+        growth_path=args.growth_path,
+        trend_path=args.trend_path,
         out_predictions_csv=args.out_predictions_csv,
         seq_len=args.seq_len,
         hidden_dim=args.hidden_dim,

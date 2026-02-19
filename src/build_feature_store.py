@@ -10,6 +10,8 @@ Builds a monthly, customer-level feature store from raw transaction data.
 """
 
 import pandas as pd
+from pathlib import Path
+import shutil
 
 df = pd.read_csv("data/raw_transactions.csv")
 df["timestamp"] = pd.to_datetime(df["timestamp"])
@@ -71,8 +73,13 @@ payment_cols = pay_features.columns.difference(["customer_id", "period"])
 def _write_partitioned(df: pd.DataFrame, path: str) -> None:
     out = df.copy()
     out["period"] = out["period"].astype(str)
+
+    out_path = Path(path)
+    if out_path.exists():
+        shutil.rmtree(out_path)
+
     out.to_parquet(
-        path,
+        out_path,
         engine="pyarrow",
         partition_cols=["period"],
         index=False,
